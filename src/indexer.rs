@@ -22,10 +22,10 @@ async fn block_is_complete(
 ) -> anyhow::Result<bool> {
     Ok(sqlx::query_scalar(
         "
-       SELECT EXISTS(
-           SELECT 1
-           FROM debug.app_hash
-           WHERE block_id = $1
+        SELECT EXISTS(
+            SELECT 1
+            FROM debug.app_hash
+            WHERE block_id = $1
     )",
     )
     .bind(block_id)
