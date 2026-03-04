@@ -841,6 +841,7 @@ impl Regenerator {
             tracing::debug!("reached height {}", height);
         }
         let block_tendermint: tendermint_v0o40::Block = block.clone().into();
+        let expected_app_hash = block_tendermint.header.app_hash.as_bytes().to_vec();
         let begin_block = BeginBlock::from(block);
         self.indexer
             .enter_block(height, block_tendermint.header.chain_id.as_str())
@@ -865,8 +866,13 @@ impl Regenerator {
             })
             .await;
         self.indexer.events(height, events, None).await?;
+        self.indexer.end_block(&expected_app_hash).await?;
         let hash = penumbra.commit().await?;
-        self.indexer.end_block(&hash).await?;
+        anyhow::ensure!(
+            hash.as_slice() == expected_app_hash.as_slice(),
+            "app hash mismatch at height {}",
+            height
+        );
 
         Ok(())
     }
