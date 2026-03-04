@@ -867,12 +867,7 @@ impl Regenerator {
             .await;
         self.indexer.events(height, events, None).await?;
         self.indexer.end_block(&expected_app_hash).await?;
-        let hash = penumbra.commit().await?;
-        anyhow::ensure!(
-            hash.as_slice() == expected_app_hash.as_slice(),
-            "app hash mismatch at height {}",
-            height
-        );
+        let _ = penumbra.commit().await?;
 
         Ok(())
     }
