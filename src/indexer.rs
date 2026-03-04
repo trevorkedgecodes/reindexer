@@ -16,11 +16,21 @@ async fn fetch_block_id(
     )
 }
 
-async fn block_exists(
+async fn block_is_complete(
     dbtx: &mut Transaction<'static, Postgres>,
-    height: u64,
+    block_id: i64,
 ) -> anyhow::Result<bool> {
-    Ok(fetch_block_id(dbtx, height).await?.is_some())
+    Ok(sqlx::query_scalar(
+        "
+       SELECT EXISTS(
+           SELECT 1
+           FROM debug.app_hash
+           WHERE block_id = $1
+    )",
+    )
+    .bind(block_id)
+    .fetch_one(dbtx.as_mut())
+    .await?)
 }
 
 async fn tx_exists(
@@ -198,8 +208,8 @@ impl Indexer {
                     tracing::debug!("tx ({}, {}) exists; skipping", height, index);
                     return Ok(());
                 }
-            } else if block_exists(&mut context.dbtx, height).await? {
-                tracing::debug!("block {} exists; skipping", height);
+            } else if block_is_complete(&mut context.dbtx, context.block_id).await? {
+                tracing::debug!("block {} is complete; skipping", height);
                 return Ok(());
             }
         }
