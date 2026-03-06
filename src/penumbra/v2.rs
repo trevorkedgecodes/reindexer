@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use cnidarium_v1::Storage;
+use cnidarium_v1::{StateDelta, Storage};
 use penumbra_sdk_app_v2::{app::App, PenumbraHost, SUBSTORE_PREFIXES};
+use penumbra_sdk_governance_v2::StateWriteExt as _;
 use penumbra_sdk_ibc_v2::component::HostInterface as _;
 
 use tendermint_v0o40 as tendermint;
@@ -41,6 +42,15 @@ impl super::Penumbra for Penumbra {
         let height = PenumbraHost::get_block_height(snapshot.clone()).await?;
         let chain_id = PenumbraHost::get_chain_id(snapshot).await?;
         Ok((height, chain_id))
+    }
+
+    async fn prepare_for_resume(&mut self) -> anyhow::Result<()> {
+        let initial_state = self.storage.latest_snapshot();
+        let mut delta = StateDelta::new(initial_state);
+        delta.ready_to_start();
+        self.storage.commit_in_place(delta).await?;
+        self.app = App::new(self.storage.latest_snapshot());
+        Ok(())
     }
 
     async fn begin_block(&mut self, req: &BeginBlock) -> Vec<Event> {
