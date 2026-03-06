@@ -29,6 +29,9 @@ trait Penumbra {
     /// where the protocol changes.
     async fn genesis(&mut self, genesis: Genesis) -> anyhow::Result<()>;
     async fn metadata(&self) -> anyhow::Result<(u64, String)>;
+    async fn prepare_for_resume(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn begin_block(&mut self, req: &BeginBlock) -> Vec<Event>;
     async fn deliver_tx(&mut self, req: &DeliverTx) -> anyhow::Result<Vec<Event>>;
     async fn end_block(&mut self, req: &EndBlock) -> Vec<Event>;
@@ -589,6 +592,7 @@ impl Regenerator {
         first_block: u64,
         last_block: Option<u64>,
     ) -> anyhow::Result<()> {
+        penumbra.prepare_for_resume().await?;
         // First, regenerate using the blocks inside the archive.
         let last_height_in_archive = self
             .archive
