@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::penumbra::RegenerationPlan;
+use sqlx::PgPool;
 
 #[derive(clap::Parser)]
 pub struct RegenAuto {
@@ -55,6 +56,32 @@ pub struct RegenAuto {
 
 impl RegenAuto {
     pub async fn run(self) -> anyhow::Result<()> {
+        async fn target_exists(pool: &PgPool, target_height: u64) -> anyhow::Result<bool> {
+            Ok(sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM blocks WHERE height = $1)",
+            )
+            .bind(i64::try_from(target_height)?)
+            .fetch_one(pool)
+            .await?)
+        }
+
+        async fn max_height_le_target(pool: &PgPool, target_height: u64) -> anyhow::Result<u64> {
+            let max_height: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(height), 0) FROM blocks WHERE height <= $1",
+            )
+            .bind(i64::try_from(target_height)?)
+            .fetch_one(pool)
+            .await?;
+            Ok(u64::try_from(max_height)?)
+        }
+
+        async fn global_max_height(pool: &PgPool) -> anyhow::Result<u64> {
+            let max_height: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(height), 0) FROM blocks")
+                .fetch_one(pool)
+                .await?;
+            Ok(u64::try_from(max_height)?)
+        }
+
         // Determine chain_id - default to penumbra-1 if not specified
         let chain_id = self.chain_id.as_deref().unwrap_or("penumbra-1");
         let home = self
@@ -66,6 +93,12 @@ impl RegenAuto {
             self.archive_file.clone(),
             self.chain_id.clone(),
         )?;
+        let archive = crate::storage::Storage::new(Some(&archive_file), Some(chain_id)).await?;
+        let final_target = archive
+            .last_height()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("archive has no blocks"))?;
+        let pg = PgPool::connect(&self.database_url).await?;
 
         // Determine working dir
         let working_dir = self
@@ -117,53 +150,110 @@ impl RegenAuto {
         );
 
         for (i, stop_height) in regen_invocations.iter().enumerate() {
-            let mut cmd = Command::new(&current_exe);
-            // Shell out to the internal "regen-step" command, so that the "sys::exit" calls in
-            // upstream Penumbra deps don't cause the current penumbra-reindexer process to exit.
-            cmd.arg("regen-step")
-                .arg("--chain-id")
-                .arg(chain_id)
-                .arg("--home")
-                .arg(&home)
-                .arg("--working-dir")
-                .arg(&working_dir)
-                .arg("--archive-file")
-                .arg(&archive_file)
-                .arg("--database-url")
-                .arg(&self.database_url);
+            let target_height = stop_height.unwrap_or(final_target);
+            let mut last_max_le_target: Option<u64> = None;
+            let mut attempts_without_progress = 0u32;
 
-            if self.allow_existing_data {
-                cmd.arg("--allow-existing-data");
-            }
+            for attempt in 1u32.. {
+                let mut cmd = Command::new(&current_exe);
+                // Shell out to the internal "regen-step" command, so that the "sys::exit" calls in
+                // upstream Penumbra deps don't cause the current penumbra-reindexer process to exit.
+                cmd.arg("regen-step")
+                    .arg("--chain-id")
+                    .arg(chain_id)
+                    .arg("--home")
+                    .arg(&home)
+                    .arg("--working-dir")
+                    .arg(&working_dir)
+                    .arg("--archive-file")
+                    .arg(&archive_file)
+                    .arg("--database-url")
+                    .arg(&self.database_url);
 
-            // Add stop height if present
-            if let Some(height) = stop_height {
-                cmd.arg("--stop-height").arg(height.to_string());
+                if self.allow_existing_data {
+                    cmd.arg("--allow-existing-data");
+                }
+
+                if let Some(height) = stop_height {
+                    cmd.arg("--stop-height").arg(height.to_string());
+                    tracing::info!(
+                        "executing regen command {} of {} (attempt {}, stop-height: {})",
+                        i + 1,
+                        regen_invocations.len(),
+                        attempt,
+                        height
+                    );
+                } else {
+                    tracing::info!(
+                        "executing final regen command {} of {} (attempt {}, no stop-height)",
+                        i + 1,
+                        regen_invocations.len(),
+                        attempt
+                    );
+                }
+                tracing::debug!("regen command is: {:?}", cmd);
+                let status = cmd.status()?;
+
+                if !status.success() {
+                    return Err(anyhow::anyhow!(
+                        "regen command {} failed on attempt {} with exit code: {:?}",
+                        i + 1,
+                        attempt,
+                        status.code()
+                    ));
+                }
+
+                let has_target = target_exists(&pg, target_height).await?;
+                let max_le_target = max_height_le_target(&pg, target_height).await?;
+                let global_max = global_max_height(&pg).await?;
+
                 tracing::info!(
-                    "executing regen command {} of {} (stop-height: {})",
+                    "regen command {} attempt {} progress: target {}, has_target={}, max_le_target={}, global_max={}",
                     i + 1,
-                    regen_invocations.len(),
-                    height
+                    attempt,
+                    target_height,
+                    has_target,
+                    max_le_target,
+                    global_max
                 );
-            } else {
-                tracing::info!(
-                    "executing final regen command {} of {} (no stop-height)",
-                    i + 1,
-                    regen_invocations.len()
-                );
-            }
-            tracing::debug!("regen command is: {:?}", cmd);
-            let status = cmd.status()?;
 
-            if !status.success() {
-                return Err(anyhow::anyhow!(
-                    "regen command {} failed with exit code: {:?}",
-                    i + 1,
-                    status.code()
-                ));
-            }
+                if global_max > target_height {
+                    tracing::warn!(
+                        "database has blocks above this step target (global_max {} > target {}); continuing until target exists",
+                        global_max,
+                        target_height
+                    );
+                }
 
-            tracing::info!("regen command {} completed successfully", i + 1);
+                if has_target {
+                    tracing::info!(
+                        "regen command {} completed successfully at target height {}",
+                        i + 1,
+                        target_height
+                    );
+                    break;
+                }
+
+                if let Some(last) = last_max_le_target {
+                    if max_le_target <= last {
+                        attempts_without_progress += 1;
+                    } else {
+                        attempts_without_progress = 0;
+                    }
+                }
+                last_max_le_target = Some(max_le_target);
+
+                if attempts_without_progress >= 3 {
+                    anyhow::bail!(
+                        "regen command {} made no progress for {} attempts; stuck at max height <= target {} of {}, target presence is {}",
+                        i + 1,
+                        attempts_without_progress + 1,
+                        target_height,
+                        max_le_target,
+                        has_target
+                    );
+                }
+            }
         }
 
         tracing::info!("all regeneration steps completed successfully");
