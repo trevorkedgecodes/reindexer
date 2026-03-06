@@ -38,7 +38,7 @@ trait Penumbra {
     async fn commit(&mut self) -> anyhow::Result<RootHash>;
 }
 
-type APenumbra = Box<dyn Penumbra>;
+type APenumbra = Box<dyn Penumbra + Send>;
 
 async fn make_a_penumbra(version: Version, working_dir: &Path) -> anyhow::Result<APenumbra> {
     match version {
